@@ -113,7 +113,7 @@ async def retrieve(namespace: str, query: str, top_k: int = 4):
 
 @app.get('/')
 def health():
-    return {"Health status" : "pinecone is healthy"}
+    return {"status" : "pinecone is healthy!"}
 
 if __name__ == "__main__":
     import uvicorn
