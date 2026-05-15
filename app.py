@@ -111,7 +111,7 @@ async def retrieve(namespace: str, query: str, top_k: int = 4):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get('/', methods=["GET", "HEAD"])
+@app.get('/health')
 def health():
     return { "status" : "pinecone is healthy!" }
 
