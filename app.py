@@ -111,9 +111,9 @@ async def retrieve(namespace: str, query: str, top_k: int = 4):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get('/health')
+@app.api_route("/health", methods=["GET", "HEAD"])
 def health():
-    return { "status" : "pinecone is healthy!" }
+    return {"status": "ok"}
 
 if __name__ == "__main__":
     import uvicorn
