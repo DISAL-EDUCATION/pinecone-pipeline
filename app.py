@@ -4,9 +4,13 @@ from pypdf import PdfReader
 from pinecone import Pinecone
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 import os
+import json
 import time
 import uuid
+from datetime import datetime, timezone
 from dotenv import load_dotenv
+from groq import Groq
+from pymongo import MongoClient
 
 load_dotenv()
 
@@ -14,12 +18,42 @@ app = FastAPI(title="Pinecone Integrated API")
 
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_INDEX_NAME = "integrated-disal"
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+MONGO_URI = os.getenv("MONGO_URI")
+# DB name defaults to the one embedded in the connection string (e.g. .../DISAL).
+MONGODB_DB = os.getenv("MONGODB_DB")
+MONGODB_COLLECTION = os.getenv("MONGODB_COLLECTION", "lessons")
 
 if not PINECONE_API_KEY:
     raise ValueError("PINECONE_API_KEY not found in environment variables. Please check your .env file.")
 
 # Initialize global Pinecone client
 pc = Pinecone(api_key=PINECONE_API_KEY)
+
+# Lazily-initialized clients (built on first use so missing keys only break the
+# lesson-plan endpoint, not the whole app / other endpoints).
+_groq_client = None
+_mongo_client = None
+
+
+def get_groq_client():
+    global _groq_client
+    if _groq_client is None:
+        if not GROQ_API_KEY:
+            raise HTTPException(status_code=500, detail="GROQ_API_KEY not set in environment.")
+        _groq_client = Groq(api_key=GROQ_API_KEY)
+    return _groq_client
+
+
+def get_lessons_collection():
+    global _mongo_client
+    if _mongo_client is None:
+        if not MONGO_URI:
+            raise HTTPException(status_code=500, detail="MONGO_URI not set in environment.")
+        _mongo_client = MongoClient(MONGO_URI)
+    db = _mongo_client[MONGODB_DB] if MONGODB_DB else _mongo_client.get_default_database()
+    return db[MONGODB_COLLECTION]
 
 
 @app.post("/ingest-pdf")
@@ -107,6 +141,133 @@ async def retrieve(namespace: str, query: str, top_k: int = 4):
             "results": results.to_dict() if hasattr(results, "to_dict") else dict(results)
         }
 
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Lesson Plan Endpoint
+class LessonPlanRequest(BaseModel):
+    namespace: str
+
+
+def fetch_namespace_text(namespace: str) -> str:
+    """Pull every chunk stored under a namespace and concatenate it.
+
+    Pinecone has no 'dump all vectors' call, so we page through the namespace's
+    IDs with index.list() and fetch the stored chunk_text for each.
+    """
+    index = pc.Index(host=os.getenv("PINECONE_HOST"))
+
+    ids = []
+    for id_batch in index.list(namespace=namespace):
+        ids.extend(id_batch)
+
+    if not ids:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No content found in namespace '{namespace}'.",
+        )
+
+    chunks = []
+    for i in range(0, len(ids), 100):
+        batch = ids[i:i + 100]
+        fetched = index.fetch(ids=batch, namespace=namespace)
+        vectors = getattr(fetched, "vectors", None) or fetched.get("vectors", {})
+        for vec in vectors.values():
+            metadata = getattr(vec, "metadata", None)
+            if metadata is None and isinstance(vec, dict):
+                metadata = vec.get("metadata", {})
+            metadata = metadata or {}
+            text = metadata.get("chunk_text")
+            if text:
+                chunks.append(text)
+
+    full_text = "\n\n".join(chunks)
+    if not full_text.strip():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Namespace '{namespace}' has records but no chunk_text to summarize.",
+        )
+    return full_text
+
+
+LESSON_PLAN_SYSTEM_PROMPT = (
+    "You are an expert instructional designer. Given course material, you produce "
+    "a structured lesson plan as JSON. Respond with ONLY a JSON object of this exact shape:\n"
+    "{\n"
+    '  "topics": [\n'
+    "    {\n"
+    '      "title": "string - a concise topic title",\n'
+    '      "chunks": ["string", "string", "string"],\n'
+    '      "quiz": [\n'
+    "        {\n"
+    '          "question": "string",\n'
+    '          "options": ["A. ...", "B. ...", "C. ...", "D. ..."],\n'
+    '          "answer": "A"\n'
+    "        }\n"
+    "      ]\n"
+    "    }\n"
+    "  ]\n"
+    "}\n"
+    "Rules: Produce between 3 and 6 topics that together cover the material. "
+    "Each topic must have exactly 3 'chunks' (clear explanatory paragraphs grounded in the "
+    "provided material) and exactly 3 quiz questions. Each quiz question must have exactly 4 "
+    "options prefixed 'A. ', 'B. ', 'C. ', 'D. ', and 'answer' must be the single letter "
+    "(A, B, C, or D) of the correct option. Base everything strictly on the provided material."
+)
+
+
+def generate_lesson_plan(course_text: str) -> dict:
+    """Call Groq to turn raw course text into the lessonPlan topics structure."""
+    client = get_groq_client()
+    completion = client.chat.completions.create(
+        model=GROQ_MODEL,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": LESSON_PLAN_SYSTEM_PROMPT},
+            {"role": "user", "content": f"Course material:\n\n{course_text}"},
+        ],
+    )
+    raw = completion.choices[0].message.content
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=502, detail="Groq returned invalid JSON.")
+
+    topics = parsed.get("topics")
+    if not isinstance(topics, list) or not topics:
+        raise HTTPException(status_code=502, detail="Groq response had no topics.")
+    return topics
+
+
+@app.post("/lesson-plan")
+async def lesson_plan(request: LessonPlanRequest):
+    try:
+        course_text = fetch_namespace_text(request.namespace)
+        topics = generate_lesson_plan(course_text)
+
+        lesson_plan_doc = {
+            "lessonPlan": {
+                "topics": topics,
+                "generatedAt": datetime.now(timezone.utc),
+            }
+        }
+
+        collection = get_lessons_collection()
+        result = collection.insert_one(lesson_plan_doc)
+
+        return {
+            "message": "Lesson plan generated and stored.",
+            "id": str(result.inserted_id),
+            "namespace": request.namespace,
+            "topic_count": len(topics),
+            "lessonPlan": {
+                "topics": topics,
+                "generatedAt": lesson_plan_doc["lessonPlan"]["generatedAt"].isoformat(),
+            },
+        }
+
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

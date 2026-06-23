@@ -11,3 +11,5 @@ pypdf
 fastapi
 uvicorn
 python-multipart
+groq
+pymongo
