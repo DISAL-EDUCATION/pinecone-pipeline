@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 from groq import Groq
 from pymongo import MongoClient
+from fastapi.middleware.cors import CORSMiddleware
 
 load_dotenv()
 
