@@ -31,6 +31,22 @@ if not PINECONE_API_KEY:
 # Initialize global Pinecone client
 pc = Pinecone(api_key=PINECONE_API_KEY)
 
+# CORS
+origins = [
+    "http://localhost:3000",      # Common React/Next.js local port
+    "http://localhost:5173",      # Common Vite/Vue local port
+    "https://ai-tutor-admin-1.onrender.com/", # Your production frontend
+]
+
+# 2. Add the CORS middleware to your FastAPI app
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,           # Allows specific origins
+    allow_credentials=True,          # Allows cookies/auth headers
+    allow_methods=["*"],             # Allows all HTTP methods (GET, POST, etc.)
+    allow_headers=["*"],             # Allows all custom headers
+)
+
 # Lazily-initialized clients (built on first use so missing keys only break the
 # lesson-plan endpoint, not the whole app / other endpoints).
 _groq_client = None
@@ -190,86 +206,86 @@ def fetch_namespace_text(namespace: str) -> str:
     return full_text
 
 
-LESSON_PLAN_SYSTEM_PROMPT = (
-    "You are an expert instructional designer. Given course material, you produce "
-    "a structured lesson plan as JSON. Respond with ONLY a JSON object of this exact shape:\n"
-    "{\n"
-    '  "topics": [\n'
-    "    {\n"
-    '      "title": "string - a concise topic title",\n'
-    '      "chunks": ["string", "string", "string"],\n'
-    '      "quiz": [\n'
-    "        {\n"
-    '          "question": "string",\n'
-    '          "options": ["A. ...", "B. ...", "C. ...", "D. ..."],\n'
-    '          "answer": "A"\n'
-    "        }\n"
-    "      ]\n"
-    "    }\n"
-    "  ]\n"
-    "}\n"
-    "Rules: Produce between 3 and 6 topics that together cover the material. "
-    "Each topic must have exactly 3 'chunks' (clear explanatory paragraphs grounded in the "
-    "provided material) and exactly 3 quiz questions. Each quiz question must have exactly 4 "
-    "options prefixed 'A. ', 'B. ', 'C. ', 'D. ', and 'answer' must be the single letter "
-    "(A, B, C, or D) of the correct option. Base everything strictly on the provided material."
-)
+# LESSON_PLAN_SYSTEM_PROMPT = (
+#     "You are an expert instructional designer. Given course material, you produce "
+#     "a structured lesson plan as JSON. Respond with ONLY a JSON object of this exact shape:\n"
+#     "{\n"
+#     '  "topics": [\n'
+#     "    {\n"
+#     '      "title": "string - a concise topic title",\n'
+#     '      "chunks": ["string", "string", "string"],\n'
+#     '      "quiz": [\n'
+#     "        {\n"
+#     '          "question": "string",\n'
+#     '          "options": ["A. ...", "B. ...", "C. ...", "D. ..."],\n'
+#     '          "answer": "A"\n'
+#     "        }\n"
+#     "      ]\n"
+#     "    }\n"
+#     "  ]\n"
+#     "}\n"
+#     "Rules: Produce between 3 and 6 topics that together cover the material. "
+#     "Each topic must have exactly 3 'chunks' (clear explanatory paragraphs grounded in the "
+#     "provided material) and exactly 3 quiz questions. Each quiz question must have exactly 4 "
+#     "options prefixed 'A. ', 'B. ', 'C. ', 'D. ', and 'answer' must be the single letter "
+#     "(A, B, C, or D) of the correct option. Base everything strictly on the provided material."
+# )
 
 
-def generate_lesson_plan(course_text: str) -> dict:
-    """Call Groq to turn raw course text into the lessonPlan topics structure."""
-    client = get_groq_client()
-    completion = client.chat.completions.create(
-        model=GROQ_MODEL,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": LESSON_PLAN_SYSTEM_PROMPT},
-            {"role": "user", "content": f"Course material:\n\n{course_text}"},
-        ],
-    )
-    raw = completion.choices[0].message.content
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=502, detail="Groq returned invalid JSON.")
+# def generate_lesson_plan(course_text: str) -> dict:
+#     """Call Groq to turn raw course text into the lessonPlan topics structure."""
+#     client = get_groq_client()
+#     completion = client.chat.completions.create(
+#         model=GROQ_MODEL,
+#         response_format={"type": "json_object"},
+#         messages=[
+#             {"role": "system", "content": LESSON_PLAN_SYSTEM_PROMPT},
+#             {"role": "user", "content": f"Course material:\n\n{course_text}"},
+#         ],
+#     )
+#     raw = completion.choices[0].message.content
+#     try:
+#         parsed = json.loads(raw)
+#     except json.JSONDecodeError:
+#         raise HTTPException(status_code=502, detail="Groq returned invalid JSON.")
 
-    topics = parsed.get("topics")
-    if not isinstance(topics, list) or not topics:
-        raise HTTPException(status_code=502, detail="Groq response had no topics.")
-    return topics
+#     topics = parsed.get("topics")
+#     if not isinstance(topics, list) or not topics:
+#         raise HTTPException(status_code=502, detail="Groq response had no topics.")
+#     return topics
 
 
-@app.post("/lesson-plan")
-async def lesson_plan(request: LessonPlanRequest):
-    try:
-        course_text = fetch_namespace_text(request.namespace)
-        topics = generate_lesson_plan(course_text)
+# @app.post("/lesson-plan")
+# async def lesson_plan(request: LessonPlanRequest):
+#     try:
+#         course_text = fetch_namespace_text(request.namespace)
+#         topics = generate_lesson_plan(course_text)
 
-        lesson_plan_doc = {
-            "lessonPlan": {
-                "topics": topics,
-                "generatedAt": datetime.now(timezone.utc),
-            }
-        }
+#         lesson_plan_doc = {
+#             "lessonPlan": {
+#                 "topics": topics,
+#                 "generatedAt": datetime.now(timezone.utc),
+#             }
+#         }
 
-        collection = get_lessons_collection()
-        result = collection.insert_one(lesson_plan_doc)
+#         collection = get_lessons_collection()
+#         result = collection.insert_one(lesson_plan_doc)
 
-        return {
-            "message": "Lesson plan generated and stored.",
-            "id": str(result.inserted_id),
-            "namespace": request.namespace,
-            "topic_count": len(topics),
-            "lessonPlan": {
-                "topics": topics,
-                "generatedAt": lesson_plan_doc["lessonPlan"]["generatedAt"].isoformat(),
-            },
-        }
+#         return {
+#             "message": "Lesson plan generated and stored.",
+#             "id": str(result.inserted_id),
+#             "namespace": request.namespace,
+#             "topic_count": len(topics),
+#             "lessonPlan": {
+#                 "topics": topics,
+#                 "generatedAt": lesson_plan_doc["lessonPlan"]["generatedAt"].isoformat(),
+#             },
+#         }
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+#     except HTTPException:
+#         raise
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.api_route("/health", methods=["GET", "HEAD"])
