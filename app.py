@@ -29,8 +29,15 @@ MONGODB_COLLECTION = os.getenv("MONGODB_COLLECTION", "lessons")
 if not PINECONE_API_KEY:
     raise ValueError("PINECONE_API_KEY not found in environment variables. Please check your .env file.")
 
-# Initialize global Pinecone client
-pc = Pinecone(api_key=PINECONE_API_KEY)
+_pinecone_client = None
+
+def get_pinecone_client():
+    global _pinecone_client
+    if _pinecone_client is None:
+        if not PINECONE_API_KEY:
+            raise ValueError("PINECONE_API_KEY not found in environment variables. Please check your .env file.")
+        _pinecone_client = Pinecone(api_key=PINECONE_API_KEY)
+    return _pinecone_client
 
 # CORS
 origins = [
@@ -100,6 +107,7 @@ async def ingest_pdf(
         chunks = text_splitter.split_text(full_text)
         
         # Get the index
+        pc = get_pinecone_client()
         index = pc.Index(PINECONE_INDEX_NAME)
         
         records = []
@@ -139,6 +147,7 @@ class RetrievalRequest(BaseModel):
 @app.get("/retrieve")
 async def retrieve(namespace: str, query: str, top_k: int = 4):
     try:
+        pc = get_pinecone_client()
         index = pc.Index(host=os.getenv("PINECONE_HOST"))
 
         results = index.search(
@@ -172,6 +181,7 @@ def fetch_namespace_text(namespace: str) -> str:
     Pinecone has no 'dump all vectors' call, so we page through the namespace's
     IDs with index.list() and fetch the stored chunk_text for each.
     """
+    pc = get_pinecone_client()
     index = pc.Index(host=os.getenv("PINECONE_HOST"))
 
     ids = []
