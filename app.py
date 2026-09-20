@@ -355,6 +355,77 @@ async def retrieve(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/namespace/{namespace}/full-content")
+async def full_content(namespace: str, chunk_type: str = "teaching"):
+    """
+    Returns every chunk of the given type in a namespace, ordered by
+    (section_index, chunk_index) to reconstruct real document order.
+
+    Unlike /retrieve, this isn't a similarity search — it pages through
+    every vector in the namespace via list()/fetch() instead of ranking
+    against one query. Used by lesson-plan generation so the model sees
+    content spanning the whole document instead of whatever a single
+    "overview" query happens to rank highest (which tends to cluster near
+    the introduction and miss material from the middle or end).
+    """
+    try:
+        index = pc.Index(host=PINECONE_HOST)
+
+        ids = []
+        for page in index.list(namespace=namespace):
+            for item in page.vectors:
+                ids.append(item.id)
+
+        if not ids:
+            raise HTTPException(status_code=404, detail=f"No content found in namespace '{namespace}'.")
+
+        chunks = []
+        batch_size = 100
+        for i in range(0, len(ids), batch_size):
+            batch_ids = ids[i:i + batch_size]
+            fetched = index.fetch(ids=batch_ids, namespace=namespace)
+            vectors = fetched.vectors if hasattr(fetched, "vectors") else fetched.get("vectors", {})
+            for vec in vectors.values():
+                metadata = getattr(vec, "metadata", None)
+                if metadata is None and isinstance(vec, dict):
+                    metadata = vec.get("metadata", {})
+                metadata = metadata or {}
+
+                if metadata.get("chunk_type") != chunk_type:
+                    continue
+                text = metadata.get("text")
+                if not text:
+                    continue
+
+                chunks.append({
+                    "text":          text,
+                    "section_index": metadata.get("section_index", 0),
+                    "chunk_index":   metadata.get("chunk_index", 0),
+                    "section_title": metadata.get("section_title", ""),
+                })
+
+        if not chunks:
+            raise HTTPException(status_code=404, detail=f"No '{chunk_type}' chunks found in namespace '{namespace}'.")
+
+        # Sort by document position — section_title is NOT reliable enough to
+        # display (heading-detection produces false positives on arbitrary
+        # PDF line-wrapping), but section_index/chunk_index still correctly
+        # reflect real position order regardless of title accuracy.
+        chunks.sort(key=lambda c: (c["section_index"], c["chunk_index"]))
+
+        return {
+            "namespace":  namespace,
+            "chunk_type": chunk_type,
+            "count":      len(chunks),
+            "chunks":     chunks,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.delete("/namespace/{namespace}")
 async def clear_namespace(namespace: str):
     """
