@@ -338,7 +338,7 @@ async def retrieve(
                 "score":         round(hit.get("_score", 0), 4),
             }
             for hit in hits
-            if hit.get("fields", {}).get("chunk_text")
+            if hit.get("fields", {}).get("text")
         ]
 
         return {
