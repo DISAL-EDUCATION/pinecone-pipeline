@@ -22,10 +22,11 @@ PINECONE_INDEX    = "disal"
 # is NOT per-namespace or per-course, so concurrent ingestions from
 # different tutors share the same budget. A ~1000-char chunk is roughly
 # 250 tokens (~4 chars/token for English), so a 96-chunk batch is roughly
-# 24,000 tokens. Pacing at one batch per 10s (~6/minute, ~144k tokens/min)
-# leaves real headroom for estimation error and concurrent uploads, rather
-# than riding right at the theoretical limit.
-EMBED_BATCH_PACING_SECONDS = 10
+# 24,000 tokens — the theoretical minimum safe gap is ~5.8s. 7s (~8.6/min,
+# ~206k tokens/min) trades some of the original headroom for meaningfully
+# faster ingestion on large documents, leaning on MAX_UPSERT_RETRIES below
+# to absorb the rare 429 this smaller margin won't self-prevent.
+EMBED_BATCH_PACING_SECONDS = 7
 MAX_UPSERT_RETRIES = 5
 
 
