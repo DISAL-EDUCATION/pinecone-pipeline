@@ -86,20 +86,24 @@ def detect_section_boundaries(text: str) -> list[int]:
 
 def education_aware_chunk(
     full_text: str,
-    teaching_chunk_size: int = 1800,
-    qa_chunk_size: int = 500,
-    overlap: int = 100,
+    chunk_size: int = 1000,
+    overlap: int = 200,
 ) -> list[dict]:
     """
-    Produces two types of chunks from the same source text:
+    Produces one "content" chunk type per section — replacing the old
+    separate "teaching" (1800 char) / "qa" (500 char) chunks, which stored
+    and embedded every document twice. That split earned its cost when
+    lesson-plan generation relied on large teaching chunks for one-shot
+    synthesis; it no longer does (see /namespace/{namespace}/full-content,
+    which reads full-document content directly, in order, regardless of
+    chunk size). A single mid-sized chunk is precise enough for live Q&A
+    and complete enough for full-document reconstruction, at half the
+    storage/embedding cost of the old scheme.
 
-    - "teaching" chunks (1800 chars): large, concept-complete segments for
-      lesson delivery. Sized so the AI can speak ~2-3 minutes per chunk.
+    1000/200 matches this pipeline's original (pre-education-aware) chunk
+    size — a known-reasonable middle ground, not a new guess.
 
-    - "qa" chunks (500 chars): small, precise segments for Q&A retrieval.
-      Sized for accurate needle-in-haystack search.
-
-    Both types respect section boundaries so concepts are never split mid-topic.
+    Respects section boundaries so concepts are never split mid-topic.
     Each chunk carries rich metadata for filtering and context.
     """
     boundaries = detect_section_boundaries(full_text)
@@ -134,31 +138,16 @@ def education_aware_chunk(
         section_title = section["title"]
         section_idx   = section["index"]
 
-        # ── Teaching chunks (large) ──────────────────────────────
-        teaching_chunks = split_with_overlap(section_text, teaching_chunk_size, overlap)
-        for j, tc in enumerate(teaching_chunks):
+        content_chunks = split_with_overlap(section_text, chunk_size, overlap)
+        for j, c in enumerate(content_chunks):
             chunks.append({
-                "id":              f"{base_id}_teach_{chunk_counter}",
-                "text":      tc,
-                "chunk_type":      "teaching",
+                "id":              f"{base_id}_chunk_{chunk_counter}",
+                "text":            c,
+                "chunk_type":      "content",
                 "section_title":   section_title,
                 "section_index":   section_idx,
                 "chunk_index":     j,
-                "char_count":      len(tc),
-            })
-            chunk_counter += 1
-
-        # ── Q&A chunks (small) ───────────────────────────────────
-        qa_chunks = split_with_overlap(section_text, qa_chunk_size, overlap)
-        for j, qc in enumerate(qa_chunks):
-            chunks.append({
-                "id":              f"{base_id}_qa_{chunk_counter}",
-                "text":      qc,
-                "chunk_type":      "qa",
-                "section_title":   section_title,
-                "section_index":   section_idx,
-                "chunk_index":     j,
-                "char_count":      len(qc),
+                "char_count":      len(c),
             })
             chunk_counter += 1
 
@@ -212,8 +201,8 @@ async def ingest_pdf(
     clear_existing:      bool       = Form(False),    # wipe old vectors for this namespace first
 ):
     """
-    Ingest a PDF with education-aware chunking.
-    Stores two chunk types per section: 'teaching' (large) and 'qa' (small).
+    Ingest a PDF with education-aware chunking — one "content" chunk type
+    per section (see education_aware_chunk for why there's only one type).
 
     - namespace: course title (must match exactly what's used in /retrieve)
     - clear_existing: set True when re-uploading updated course materials
@@ -269,8 +258,6 @@ async def ingest_pdf(
             )
             batches_upserted += 1
 
-        teaching_count = sum(1 for c in chunks if c["chunk_type"] == "teaching")
-        qa_count       = sum(1 for c in chunks if c["chunk_type"] == "qa")
         sections_found = len(set(c["section_index"] for c in chunks))
 
         return {
@@ -280,8 +267,6 @@ async def ingest_pdf(
             "filename":         file.filename,
             "pages_processed":  len(pages),
             "sections_found":   sections_found,
-            "teaching_chunks":  teaching_count,
-            "qa_chunks":        qa_count,
             "total_chunks":     len(chunks),
             "batches_upserted": batches_upserted,
         }
@@ -292,6 +277,19 @@ async def ingest_pdf(
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         file.file.close()
+
+
+# Ingestion moved from a "teaching"/"qa" split to a single "content" chunk
+# type (see education_aware_chunk), but courses ingested before that change
+# still only have "teaching"/"qa" chunks in Pinecone, and won't get
+# re-chunked unless their content is re-uploaded. Callers keep asking for
+# "teaching" or "qa" as before — this expands that into an $in match against
+# whichever type a given course's namespace actually has, so old and new
+# courses both work without the caller needing to know which era it's from.
+CHUNK_TYPE_COMPAT = {
+    "teaching": ["teaching", "content"],
+    "qa":       ["qa", "content"],
+}
 
 
 @app.get("/retrieve")
@@ -318,8 +316,8 @@ async def retrieve(
             "inputs": {"text": query},
             "top_k":  top_k,
         }
-        if chunk_type in ("teaching", "qa"):
-            query_params["filter"] = {"chunk_type": {"$eq": chunk_type}}
+        if chunk_type in CHUNK_TYPE_COMPAT:
+            query_params["filter"] = {"chunk_type": {"$in": CHUNK_TYPE_COMPAT[chunk_type]}}
 
         results = index.search(
             namespace=namespace,
@@ -327,7 +325,10 @@ async def retrieve(
         )
 
         raw = results.to_dict() if hasattr(results, "to_dict") else dict(results)
-        hits = raw.get("results", {}).get("result", {}).get("hits", [])
+        # raw's own top-level key is "result" (singular) — the double-nested
+        # "results.result" shape only exists on the *outer* HTTP response,
+        # after this function wraps `raw` under its own "results" key below.
+        hits = raw.get("result", {}).get("hits", [])
 
         # Return structured hit list for easier consumption by the backend
         clean_hits = [
@@ -355,10 +356,18 @@ async def retrieve(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# The real, non-duplicate content type for a course, regardless of which
+# ingestion era it came from — "content" for anything ingested after the
+# teaching/qa unification, "teaching" for anything ingested before it.
+# "qa" is deliberately never included: it's always a finer-grained,
+# overlapping duplicate of the same underlying text, in both eras.
+FULL_CONTENT_CHUNK_TYPES = ("content", "teaching")
+
+
 @app.get("/namespace/{namespace}/full-content")
-async def full_content(namespace: str, chunk_type: str = "teaching"):
+async def full_content(namespace: str):
     """
-    Returns every chunk of the given type in a namespace, ordered by
+    Returns every real (non-duplicate) chunk in a namespace, ordered by
     (section_index, chunk_index) to reconstruct real document order.
 
     Unlike /retrieve, this isn't a similarity search — it pages through
@@ -391,7 +400,7 @@ async def full_content(namespace: str, chunk_type: str = "teaching"):
                     metadata = vec.get("metadata", {})
                 metadata = metadata or {}
 
-                if metadata.get("chunk_type") != chunk_type:
+                if metadata.get("chunk_type") not in FULL_CONTENT_CHUNK_TYPES:
                     continue
                 text = metadata.get("text")
                 if not text:
@@ -401,23 +410,21 @@ async def full_content(namespace: str, chunk_type: str = "teaching"):
                     "text":          text,
                     "section_index": metadata.get("section_index", 0),
                     "chunk_index":   metadata.get("chunk_index", 0),
-                    "section_title": metadata.get("section_title", ""),
                 })
 
         if not chunks:
-            raise HTTPException(status_code=404, detail=f"No '{chunk_type}' chunks found in namespace '{namespace}'.")
+            raise HTTPException(status_code=404, detail=f"No content chunks found in namespace '{namespace}'.")
 
-        # Sort by document position — section_title is NOT reliable enough to
-        # display (heading-detection produces false positives on arbitrary
-        # PDF line-wrapping), but section_index/chunk_index still correctly
-        # reflect real position order regardless of title accuracy.
+        # Sort by document position — section_title (not returned here) isn't
+        # reliable enough to display, since heading-detection produces false
+        # positives on arbitrary PDF line-wrapping, but section_index/
+        # chunk_index still correctly reflect real position order regardless.
         chunks.sort(key=lambda c: (c["section_index"], c["chunk_index"]))
 
         return {
-            "namespace":  namespace,
-            "chunk_type": chunk_type,
-            "count":      len(chunks),
-            "chunks":     chunks,
+            "namespace": namespace,
+            "count":     len(chunks),
+            "chunks":    chunks,
         }
 
     except HTTPException:
