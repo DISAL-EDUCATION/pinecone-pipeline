@@ -17,6 +17,48 @@ PINECONE_API_KEY  = os.getenv("PINECONE_API_KEY")
 PINECONE_HOST     = os.getenv("PINECONE_HOST")
 PINECONE_INDEX    = "disal"
 
+# Pinecone's integrated embedding (llama-text-embed-v2) enforces a shared,
+# account-wide limit of 250,000 tokens/minute for passage-type input — this
+# is NOT per-namespace or per-course, so concurrent ingestions from
+# different tutors share the same budget. A ~1000-char chunk is roughly
+# 250 tokens (~4 chars/token for English), so a 96-chunk batch is roughly
+# 24,000 tokens. Pacing at one batch per 10s (~6/minute, ~144k tokens/min)
+# leaves real headroom for estimation error and concurrent uploads, rather
+# than riding right at the theoretical limit.
+EMBED_BATCH_PACING_SECONDS = 10
+MAX_UPSERT_RETRIES = 5
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    status_code = getattr(exc, "status_code", None)
+    if status_code == 429:
+        return True
+    return "RESOURCE_EXHAUSTED" in str(exc) or "429" in str(exc)
+
+
+def _upsert_batch_with_backoff(index, records: list[dict], namespace: str) -> None:
+    """
+    Upserts one batch, retrying with exponential backoff if Pinecone's own
+    embedding rate limit rejects it (429) — a safety net for when pacing
+    alone isn't enough, e.g. another tutor's upload is sharing the same
+    account-wide budget at the same time.
+    """
+    delay = 5
+    for attempt in range(MAX_UPSERT_RETRIES):
+        try:
+            index.upsert_records(records=records, namespace=namespace)
+            return
+        except Exception as e:
+            if not _is_rate_limit_error(e) or attempt == MAX_UPSERT_RETRIES - 1:
+                raise
+            print(
+                f"Pinecone embedding rate limit hit — retrying batch in {delay}s "
+                f"(attempt {attempt + 1}/{MAX_UPSERT_RETRIES})"
+            )
+            time.sleep(delay)
+            delay = min(delay * 2, 60)
+
+
 if not PINECONE_API_KEY:
     raise ValueError("PINECONE_API_KEY not set in environment.")
 
@@ -248,15 +290,18 @@ async def ingest_pdf(
             for chunk in chunks
         ]
 
-        # Upsert in batches of 96
+        # Upsert in batches of 96, paced to stay under Pinecone's embedding
+        # rate limit — see EMBED_BATCH_PACING_SECONDS above. A large document
+        # (many batches) will take longer to ingest as a result; that's a
+        # deliberate trade for not failing outright on a 429 partway through.
         batch_size = 96
+        total_batches = (len(records) + batch_size - 1) // batch_size
         batches_upserted = 0
         for i in range(0, len(records), batch_size):
-            index.upsert_records(
-                records=records[i : i + batch_size],
-                namespace=namespace,
-            )
+            _upsert_batch_with_backoff(index, records[i : i + batch_size], namespace)
             batches_upserted += 1
+            if batches_upserted < total_batches:
+                time.sleep(EMBED_BATCH_PACING_SECONDS)
 
         sections_found = len(set(c["section_index"] for c in chunks))
 
