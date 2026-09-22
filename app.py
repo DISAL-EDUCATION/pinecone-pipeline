@@ -130,7 +130,7 @@ def detect_section_boundaries(text: str) -> list[int]:
 def education_aware_chunk(
     full_text: str,
     chunk_size: int = 1000,
-    overlap: int = 200,
+    overlap: int = 250,
 ) -> list[dict]:
     """
     Produces one "content" chunk type per section — replacing the old
@@ -143,8 +143,9 @@ def education_aware_chunk(
     and complete enough for full-document reconstruction, at half the
     storage/embedding cost of the old scheme.
 
-    1000/200 matches this pipeline's original (pre-education-aware) chunk
-    size — a known-reasonable middle ground, not a new guess.
+    1000/250 matches this pipeline's original (pre-education-aware) chunk
+    size and overlap exactly — a known-reasonable middle ground, not a new
+    guess.
 
     Respects section boundaries so concepts are never split mid-topic.
     Each chunk carries rich metadata for filtering and context.
