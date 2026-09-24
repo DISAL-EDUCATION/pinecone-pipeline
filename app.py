@@ -97,6 +97,21 @@ HEADING_PATTERNS = [
 HEADING_RE = re.compile("|".join(HEADING_PATTERNS), re.MULTILINE | re.IGNORECASE)
 
 
+def _sanitize_text(text: str) -> str:
+    """
+    Some PDFs (broken/custom CID font encodings — math symbols and other
+    embedded fonts are common offenders) make pypdf decode certain glyphs
+    into lone UTF-16 surrogate codepoints (U+D800-U+DFFF). Those are valid
+    in a Python str but have no UTF-8 representation, so they pass through
+    extraction and chunking fine and only blow up later when Pinecone's SDK
+    JSON-encodes the upsert body ("str is not valid UTF-8: surrogates not
+    allowed") — by then there's no way to tell which record caused it.
+    Round-tripping through UTF-8 here drops anything unrepresentable right
+    at the source.
+    """
+    return text.encode("utf-8", "ignore").decode("utf-8")
+
+
 def extract_text_from_pdf(file) -> tuple[str, list[dict]]:
     """
     Extract text from PDF page by page.
@@ -105,7 +120,7 @@ def extract_text_from_pdf(file) -> tuple[str, list[dict]]:
     reader = PdfReader(file)
     pages = []
     for i, page in enumerate(reader.pages):
-        text = page.extract_text() or ""
+        text = _sanitize_text(page.extract_text() or "")
         if text.strip():
             pages.append({"page_num": i + 1, "text": text})
     full_text = "\n".join(p["text"] for p in pages)
